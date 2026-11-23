@@ -15,7 +15,9 @@ fn test_big_tiff() {
     for filename in filenames.iter() {
         let path = PathBuf::from(TEST_IMAGE_DIR).join(filename);
         let img_file = File::open(path).expect("Cannot find test image!");
-        let mut decoder = Decoder::new(img_file).expect("Cannot create decoder");
+        let mut decoder = Decoder::open(img_file).expect("Cannot create decoder");
+        decoder.next_image().expect("Cannot read image");
+
         assert_eq!(
             decoder.dimensions().expect("Cannot get dimensions"),
             (64, 64)
@@ -24,21 +26,20 @@ fn test_big_tiff() {
             decoder.colortype().expect("Cannot get colortype"),
             ColorType::RGB(8)
         );
+
+        let mut ifd = decoder.current_ifd();
         assert_eq!(
-            decoder
-                .get_tag_u64(Tag::StripOffsets)
+            ifd.get_tag_u64(Tag::StripOffsets)
                 .expect("Cannot get StripOffsets"),
             16
         );
         assert_eq!(
-            decoder
-                .get_tag_u64(Tag::RowsPerStrip)
+            ifd.get_tag_u64(Tag::RowsPerStrip)
                 .expect("Cannot get RowsPerStrip"),
             64
         );
         assert_eq!(
-            decoder
-                .get_tag_u64(Tag::StripByteCounts)
+            ifd.get_tag_u64(Tag::StripByteCounts)
                 .expect("Cannot get StripByteCounts"),
             12288
         )

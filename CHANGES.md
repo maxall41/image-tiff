@@ -1,3 +1,177 @@
+# Version 0.12.0 (unreleased)
+
+Fixes:
+- Decoding a tiled image whose width is not a multiple of the tile width no
+  longer corrupts the columns below the right border tiles when extra samples
+  are discarded (e.g. RGB with an unspecified extra sample). The horizontal
+  tile padding was written past the end of the output row, spilling into the
+  leftmost columns of the following row.
+
+Additions:
+- Added the `TiffHeader` type. It can be used to create a `Decoder` in a state
+  before the first IFD and allows opening files at an arbitrary first IFD
+  offset rather than one indicated by an encoded header at the start.
+
+Changes:
+- The IFD iteration methods on `Decoder` (`next_image`, `seek_to_image`, etc)
+  now come with a strong error guarantee. They will not modify the current
+  directory state if they fail. This includes the failure to interpret an IFD
+  as a supported image in the case of `*_image` variants.
+
+Compatibility:
+- Changed how tiled TIFF files are detected. The presence of a TileWidth OR
+  TileHeight/TileLength tag now marks an image as tiled. Data is no retrieved
+  from either StripOffsets or TileOffsets with the latter taking precedence.
+  This is closer to the behavior of libtiff.
+
+# Version 0.11.3
+
+Additions:
+- Added support for `webp` compression (as per GDAL) under the `webp` feature flag (default: off).
+- Added `Decoder::image_ifd`, creating an `IfdDecoder` of the current IFD.
+- Added `IfdDecoder::directory`, returning the `Directory` underlying it.
+- Added `LowerHex` and `UpwerHex` implementations for `IfdPointer`.
+
+Notes:
+- A new example `tiff-ls` demonstrates use of the new features.
+
+# Version 0.11.2
+
+Changes:
+- Planar files can now be read with `Decoder::read_image_to_buffer` if the
+  limits allow for such a large buffer size. Previously only the first plane
+  was read and the decoder will attempt a fallback to this behavior if the
+  limits do not allow all planes to be allocated.
+
+Fixes:
+- An off-by-one error in a `debug_assert` of `ValueBuffer` caused its use in
+  `IfdDecoder::find_tag_buf` to panic outside release mode when the buffer
+  exactly matched the required size.
+
+Additions:
+- The methods `ColorType::{num_samples, bit_depth}` are now public. This
+  promises that we only have homogeneous color depths in this major version.
+
+# Version 0.11.1
+
+Fixes:
+- The enumeration types in `tags` are now all marked with a representation of
+  their underlying TIFF type (e.g. `repr(u16)`) and variants are explicitly
+  assigned their corresponding values. That is you may _read_ the raw
+  discriminant and interpret that as the value—except for `Unknown` variants.
+- The variants `RationalBig` and `SRationalBig` of `decoder::ifd::Value` are
+  deprecated as they have no corresponding TIFF type and were not constructed
+  during decoding.
+
+Additions:
+- Types in `tags` now generally implement `TiffValue` and can be handed to the
+  `DirectoryEncoder::write_tag` method. Unlike primitive types they do _not_
+  always implement the trait for slices of themselves.
+- Added `tags::ValueBuffer`, a byte-based buffer for tags with a runtime value
+  type and count.
+- Added `IfdDecoder::find_tag_{buf,bytes}` to read tag values into a
+  `ValueBuffer` or byte slice respectively without interpreting them
+  immediately within the Rust type system.
+- Added `DirectoryEncoder::write_{data,tag}_buf` that takes a `ValueBuffer`
+  instead of a statically typed argument.
+- Added `DirectoryEncoder::write_entry{,_buf,_bytes}` that encode their
+  argument into the file and return an `Entry` for later use, without
+  immediately adding a tag-entry pair to the directory.
+- The `TiffValue` trait is now implemented for several builtin `tags::*` types
+  or slices of them as appropriate for their use as values of their intended
+  TIFF tag.
+- The `TiffValue` trait is now implemented for `[T; N]` for all types that
+  implement it for slices.
+
+# Version 0.11.0
+
+- `Directory` now implements `FromIterator<(Tag, Value)>`.
+
+Changes:
+- The decoder now interprets the `ExtraSamples` tag. The sample count must now
+  more strict match the expected value with alpha channels only allowing for
+  explicitly denoted unassociated or associated alpha. This effects the
+  indicated color type when decoding images with additional samples indicated
+  as unspecified relation.  Previously, these may have been interpreted as
+  alpha by the total sample count (e.g. RgbA if 4 samples under a photometric
+  interpretation of RGB).
+- The decoder handles planar data, current limited to non-subsampled channels.
+  The `Decoder::read_image` method return planes one-after-another depending on
+  the size of the buffer that was passed.
+- `Decoder::read_image_to_buffer` now takes `&mut DecodingResult` and resizes
+  it according to the required layout. Previously, a borrowed `DecodingBuffer`
+  was passed which can be replaced by calling `as_bytes_mut` and
+  `read_image_bytes`.
+- Several methods of tags are now `const`. Note that does not guarantee any
+  particular value when calling these methods.
+
+Fixes:
+- Fix a bug in the uncompressed encoder that could lead to short writes, i.e.
+  data silently dropped when the underlying writer did not accept all data in a
+  single write call.
+- Encoding YCbCr data now writes the `ChromaSubsampling` tag as `(1, 1)` to
+  indicate no subsampling, instead of leaving it at its default of `(2, 2)`.
+- The decoder will reject subsampled YCbCr data as there is no upsampling
+  routine, except for JPEG compressed images where the JPEG decoders handles
+  this. Since the buffer in that case indicates a full-sized plane for all
+  color samples any future support for the tag will upsample all planes (at
+  least within this major version).
+
+Additions:
+- Added support for the `CieLab` color type.
+- Added `DecodingResult::resize_to` to create a buffer with a matching sample
+  type and dimensions.
+- Added `ByteOrder::native` to access the platform's native endianness.
+- Added `ByteOrder::convert` to change the byte-order of values in a byte
+  buffer, depending on their `Type` as described at runtime.
+- Added `DirectoryOffset::new` to encode a directory whose offset is known to
+  the caller but that has not been written through the encoder itself.
+- Added `Encoder::extra_samples` to encode images with more samples than their
+  color's trait implementation would otherwise suggest.
+- Added `DirectoryEncoder::extend_from` to encode multiple tag entries from a
+  directory whose values were written to the file by means outside the
+  encoder's control.
+- Added `Decoder::read_coding_unit_bytes` to retrieve data of corresponding
+  coordinates from potentially planar data, which is encoded in multiple chunks
+  of the file.
+
+# Version 0.10.3
+
+New features:
+- Group 4 `fax` is now recognized as a compression type and decoded.
+- A crate feature `fax` controls related dependencies, on by default.
+
+Changes:
+- The presence of PhotometricInterpretation::WhiteIsZero now returns an error
+  if the color type can not be inverted by the library where they were
+  previously silently ignored. Please report any missing color types.
+
+Fixes:
+- The PhotometricInterpretation::WhiteIsZero is now also applied to 1-bit
+  images, as well as 2-bit and 4-bit sample types where previously the presence
+  of this tag was ignored.
+
+# Version 0.10.2
+
+Republished 0.10.1, fixing an accidentally removed method (`Decoder::find_tag_unsigned_vec`).
+
+# Version 0.10.1
+
+New features:
+ - Added a dedicated `Directory` type (#277)
+ - Expose methods related to `Directory` publicly (#278)
+ - Implement writing directories (#281, #283)
+ - Add ICC (color profile) to the set of known tags (#287)
+ - Added `Decoder.inner()` to access the underlying reader (#289)
+ - Added methods for reading into a pre-allocated byte buffer (#285)
+
+Changes:
+ - No longer perform color conversion when decoding embedded JPEG. This fixes decoding for JPEG images with alpha channel. (#274)
+ - More lenient LZW decoding to match libtiff (#231)
+
+Fixes:
+ - Fixed seeking multiple times in a row (#279)
+
 # Version 0.10.0
 
 New features:

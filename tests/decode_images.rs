@@ -1,25 +1,31 @@
 extern crate tiff;
 
-use tiff::decoder::{ifd, Decoder, DecodingResult};
+use tiff::decoder::{ifd, Decoder, DecodingSampleBuffer};
+use tiff::tags::{ByteOrder, PhotometricInterpretation, SampleFormat, Type};
 use tiff::ColorType;
 
 use std::fs::File;
-use std::io::{Read, Seek};
+use std::io::{Cursor, Read, Seek};
 use std::path::PathBuf;
 
 const TEST_IMAGE_DIR: &str = "./tests/images/";
+const SEQ_IMAGE_DIR: &str = "./tests/images/seq/";
 
 macro_rules! test_image_sum {
     ($name:ident, $buffer:ident, $sum_ty:ty) => {
         fn $name(file: &str, expected_type: ColorType, expected_sum: $sum_ty) {
             let path = PathBuf::from(TEST_IMAGE_DIR).join(file);
             let img_file = File::open(path).expect("Cannot find test image!");
-            let mut decoder = Decoder::new(img_file).expect("Cannot create decoder");
+            let mut decoder = Decoder::open(img_file)
+                .expect("Cannot create decoder")
+                .with_lenient(true);
+
+            decoder.next_image().expect("Cannot read image IFD");
             assert_eq!(decoder.colortype().unwrap(), expected_type);
             let img_res = decoder.read_image().unwrap();
 
             match img_res {
-                DecodingResult::$buffer(res) => {
+                DecodingSampleBuffer::$buffer(res) => {
                     let sum: $sum_ty = res.into_iter().map(<$sum_ty>::from).sum();
                     assert_eq!(sum, expected_sum);
                 }
@@ -38,13 +44,204 @@ test_image_sum!(test_image_sum_u64, U64, u64);
 test_image_sum!(test_image_sum_f32, F32, f32);
 test_image_sum!(test_image_sum_f64, F64, f64);
 
+/// Compute a CRC32 hash of the full decoded TIFF output including metadata.
+///
+/// Hashes: page count, and for each page: dimensions, color type, and decoded
+/// sample data (in little-endian byte order for multi-byte types). This catches
+/// wrong dimensions, wrong color type, byte-order errors, bit-alignment errors,
+/// stride/padding errors, and pixel value errors.
+fn compute_tiff_hash<R: Read + Seek>(reader: R) -> u32 {
+    let mut decoder = Decoder::open(reader).expect("Cannot create decoder");
+    let mut hasher = crc32fast::Hasher::new();
+
+    let mut page = 0u32;
+    loop {
+        decoder.next_image().expect("Cannot read image IFD");
+        let (width, height) = decoder.dimensions().unwrap();
+        let color_type = decoder.colortype().unwrap();
+        let mut result = decoder.read_image().unwrap();
+
+        // Hash page index + dimensions
+        hasher.update(&page.to_le_bytes());
+        hasher.update(&width.to_le_bytes());
+        hasher.update(&height.to_le_bytes());
+
+        // Hash color type (discriminant + fields)
+        match color_type {
+            ColorType::Gray(n) => hasher.update(&[0, n]),
+            ColorType::RGB(n) => hasher.update(&[1, n]),
+            ColorType::Palette(n) => hasher.update(&[2, n]),
+            ColorType::GrayA(n) => hasher.update(&[3, n]),
+            ColorType::RGBA(n) => hasher.update(&[4, n]),
+            ColorType::CMYK(n) => hasher.update(&[5, n]),
+            ColorType::CMYKA(n) => hasher.update(&[6, n]),
+            ColorType::YCbCr(n) => hasher.update(&[7, n]),
+            ColorType::Lab(n) => hasher.update(&[8, n]),
+            ColorType::Multiband {
+                bit_depth,
+                num_samples,
+            } => {
+                hasher.update(&[9, bit_depth]);
+                hasher.update(&num_samples.to_le_bytes());
+            }
+            other => panic!("compute_tiff_hash: unhandled ColorType {other:?}"),
+        }
+
+        // Hash decoded data: TIFF type tag (u16 repr) + LE sample bytes.
+        // Map each variant to the corresponding TIFF Type for byte-order normalization.
+        let sample_type = match &result {
+            DecodingSampleBuffer::U8(_) => Type::BYTE,
+            DecodingSampleBuffer::I8(_) => Type::SBYTE,
+            DecodingSampleBuffer::U16(_) => Type::SHORT,
+            DecodingSampleBuffer::I16(_) => Type::SSHORT,
+            DecodingSampleBuffer::U32(_) => Type::LONG,
+            DecodingSampleBuffer::I32(_) => Type::SLONG,
+            DecodingSampleBuffer::F32(_) => Type::FLOAT,
+            DecodingSampleBuffer::U64(_) => Type::LONG8,
+            DecodingSampleBuffer::I64(_) => Type::SLONG8,
+            DecodingSampleBuffer::F64(_) => Type::DOUBLE,
+            DecodingSampleBuffer::F16(_) => Type::SHORT, // f16 is 2 bytes like SHORT
+        };
+        hasher.update(&sample_type.to_u16().to_le_bytes());
+
+        let mut buf = result.as_buffer(0);
+        let bytes = buf.as_bytes_mut();
+        ByteOrder::native().convert(sample_type, bytes, ByteOrder::LittleEndian);
+        hasher.update(bytes);
+
+        page += 1;
+        if !decoder.more_images() {
+            break;
+        }
+    }
+
+    // Hash total page count at the end
+    hasher.update(&page.to_le_bytes());
+    hasher.finalize()
+}
+
+/// Verify all TIFF files in tests/images/seq/ against their filename-embedded CRC32 hash.
+///
+/// Each file is named `<description>-<8hex>.tiff` where the last segment before `.tiff`
+/// is the expected CRC32 hash of (dimensions, color type, decoded data) for all pages.
+#[test]
+fn verify_all_seq_images() {
+    let seq_dir = std::path::Path::new(SEQ_IMAGE_DIR);
+    if !seq_dir.is_dir() {
+        panic!("seq image directory not found: {}", seq_dir.display());
+    }
+
+    let mut files: Vec<_> = std::fs::read_dir(seq_dir)
+        .expect("Cannot read seq image directory")
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path()
+                .extension()
+                .is_some_and(|ext| ext == "tiff" || ext == "tif")
+        })
+        .collect();
+    files.sort_by_key(|e| e.file_name());
+
+    assert!(
+        !files.is_empty(),
+        "No .tiff files found in {}",
+        seq_dir.display()
+    );
+
+    let mut failures = Vec::new();
+    for entry in &files {
+        let path = entry.path();
+        let stem = path.file_stem().unwrap().to_str().unwrap();
+
+        // Extract expected hash: last '-'-delimited segment
+        let expected_hash = stem
+            .rsplit('-')
+            .next()
+            .expect("filename must contain a '-' before the hash");
+
+        // Validate it looks like an 8-char hex string
+        if expected_hash.len() != 8 || !expected_hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            failures.push(format!(
+                "{}: filename does not end with 8-char hex hash (got '{}')",
+                stem, expected_hash
+            ));
+            continue;
+        }
+
+        let file = File::open(&path).expect("Cannot open test image");
+        let actual_hash = format!("{:08x}", compute_tiff_hash(file));
+
+        if actual_hash != expected_hash {
+            failures.push(format!(
+                "{}: expected hash {} but got {}",
+                stem, expected_hash, actual_hash
+            ));
+        }
+    }
+
+    if !failures.is_empty() {
+        panic!(
+            "{} of {} seq images failed hash verification:\n  {}",
+            failures.len(),
+            files.len(),
+            failures.join("\n  ")
+        );
+    }
+
+    eprintln!("Verified {} seq images", files.len());
+}
+
+/// Helper: print the correct hash-suffixed filename for every *.tiff in tests/images/seq/.
+/// Run with: cargo test print_seq_hashes -- --ignored --nocapture
+#[test]
+#[ignore]
+fn print_seq_hashes() {
+    let dir = std::path::Path::new(SEQ_IMAGE_DIR);
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .expect("Cannot read image directory")
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with("seq-") && n.ends_with(".tiff"))
+        })
+        .collect();
+    files.sort_by_key(|e| e.file_name());
+
+    for entry in &files {
+        let path = entry.path();
+        let name = path.file_name().unwrap().to_str().unwrap();
+        let file = File::open(&path).expect("Cannot open test image");
+        let hash = format!("{:08x}", compute_tiff_hash(file));
+        // Strip the old hash (last -XXXXXXXX before .tiff) if present
+        let stem = path.file_stem().unwrap().to_str().unwrap();
+        let base = match stem.rsplit_once('-') {
+            Some((prefix, suffix))
+                if suffix.len() == 8 && suffix.chars().all(|c| c.is_ascii_hexdigit()) =>
+            {
+                prefix
+            }
+            _ => stem,
+        };
+        let new_name = format!("{base}-{hash}.tiff");
+        if new_name != name {
+            eprintln!("RENAME: {name} -> {new_name}");
+        } else {
+            eprintln!("OK: {name}");
+        }
+    }
+}
+
 /// Tests that a decoder can be constructed for an image and the color type
 /// read from the IFD and is of the appropriate type, but the type is
 /// unsupported.
+#[allow(dead_code)]
 fn test_image_color_type_unsupported(file: &str, expected_type: ColorType) {
     let path = PathBuf::from(TEST_IMAGE_DIR).join(file);
     let img_file = File::open(path).expect("Cannot find test image!");
-    let mut decoder = Decoder::new(img_file).expect("Cannot create decoder");
+    let mut decoder = Decoder::open(img_file).expect("Cannot create decoder");
+    decoder.next_image().expect("Cannot read image IFD");
+
     assert_eq!(decoder.colortype().unwrap(), expected_type);
     assert!(matches!(
         decoder.read_image(),
@@ -70,13 +267,54 @@ fn test_cmyk_f32() {
 }
 
 #[test]
+fn test_palette_u1() {
+    test_image_sum_u8("palette-1c-1b.tiff", ColorType::Palette(1), 379313);
+}
+
+#[test]
+fn test_palette_u4() {
+    test_image_sum_u8("palette-1c-4b.tiff", ColorType::Palette(4), 1480490);
+}
+
+#[test]
+fn test_palette_u8() {
+    test_image_sum_u8("palette-1c-8b.tiff", ColorType::Palette(8), 2876948);
+}
+
+#[test]
+fn test_palette_color_map() {
+    let path = PathBuf::from(TEST_IMAGE_DIR).join("palette-1c-8b.tiff");
+    let img_file = File::open(path).expect("Cannot find test image!");
+    let mut decoder = Decoder::open(img_file).expect("Cannot create decoder");
+    decoder.next_image().expect("Cannot read image IFD");
+
+    assert_eq!(decoder.colortype().unwrap(), ColorType::Palette(8));
+
+    let color_map = decoder
+        .color_map()
+        .expect("Palette image should have a color map");
+    // 8-bit palette: 3 * 256 = 768 entries
+    assert_eq!(color_map.len(), 768);
+
+    // Each section (R, G, B) has 256 entries
+    let r = &color_map[..256];
+    let g = &color_map[256..512];
+    let b = &color_map[512..768];
+
+    // Verify all values are valid u16 (non-zero palette, at least some variation)
+    assert!(r.iter().any(|&v| v > 0));
+    assert!(g.iter().any(|&v| v > 0));
+    assert!(b.iter().any(|&v| v > 0));
+}
+
+#[test]
 fn test_gray_u8() {
     test_image_sum_u8("minisblack-1c-8b.tiff", ColorType::Gray(8), 2840893);
 }
 
 #[test]
 fn test_gray_u12() {
-    test_image_color_type_unsupported("12bit.cropped.tiff", ColorType::Gray(12));
+    test_image_sum_u16("12bit.cropped.tiff", ColorType::Gray(12), 10973);
 }
 
 #[test]
@@ -115,7 +353,7 @@ fn test_rgb_u8() {
 
 #[test]
 fn test_rgb_u12() {
-    test_image_color_type_unsupported("12bit.cropped.rgb.tiff", ColorType::RGB(12));
+    test_image_sum_u16("12bit.cropped.rgb.tiff", ColorType::RGB(12), 32919);
 }
 
 #[test]
@@ -166,8 +404,12 @@ fn test_string_tags() {
     for filename in filenames.iter() {
         let path = PathBuf::from(TEST_IMAGE_DIR).join(filename);
         let img_file = File::open(path).expect("Cannot find test image!");
-        let mut decoder = Decoder::new(img_file).expect("Cannot create decoder");
-        let software = decoder.get_tag(tiff::tags::Tag::Software).unwrap();
+        let mut decoder = Decoder::open(img_file).expect("Cannot create decoder");
+        decoder.next_image().expect("Cannot read image IFD");
+        let software = decoder
+            .current_ifd()
+            .get_tag(tiff::tags::Tag::Software)
+            .unwrap();
         match software {
             ifd::Value::Ascii(s) => assert_eq!(
                 &s,
@@ -190,10 +432,11 @@ fn test_decode_data() {
         }
     }
     let file = File::open("./tests/decodedata-rgb-3c-8b.tiff").unwrap();
-    let mut decoder = Decoder::new(file).unwrap();
+    let mut decoder = Decoder::open(file).unwrap();
+    decoder.next_image().expect("Cannot read image IFD");
     assert_eq!(decoder.colortype().unwrap(), ColorType::RGB(8));
     assert_eq!(decoder.dimensions().unwrap(), (100, 100));
-    if let DecodingResult::U8(img_res) = decoder.read_image().unwrap() {
+    if let DecodingSampleBuffer::U8(img_res) = decoder.read_image().unwrap() {
         assert_eq!(image_data, img_res);
     } else {
         panic!("Wrong data type");
@@ -233,13 +476,46 @@ fn test_tiled_rect_rgb_u8() {
 }
 
 #[test]
+fn test_tiled_extra_samples_border_u8() {
+    // Regression test for https://github.com/image-rs/image-tiff/issues/400
+    //
+    // A tiled image whose dimensions are not multiples of the tile size, with
+    // an extra sample that is discarded on decode. The horizontal padding of
+    // the right border tiles used to be written past the end of the output
+    // row, spilling into the leftmost columns of the following row. The
+    // fixture's tile padding is filled with 0xEE so any spill is visible.
+    let path = PathBuf::from(TEST_IMAGE_DIR).join("tiled-extra-samples-border-u8.tif");
+    let img_file = File::open(path).expect("Cannot find test image!");
+    let mut decoder = Decoder::open(img_file).expect("Cannot create decoder");
+    decoder.next_image().expect("Cannot read image IFD");
+    assert_eq!(decoder.dimensions().unwrap(), (40, 40));
+    assert_eq!(decoder.colortype().unwrap(), ColorType::RGB(8));
+
+    let DecodingSampleBuffer::U8(data) = decoder.read_image().unwrap() else {
+        panic!("Wrong bit depth")
+    };
+
+    let mut expected = Vec::with_capacity(40 * 40 * 3);
+    for y in 0..40u32 {
+        for x in 0..40u32 {
+            expected.push(((x * 3) % 251) as u8);
+            expected.push(((y * 7) % 251) as u8);
+            expected.push(((x + y) % 251) as u8);
+        }
+    }
+    assert_eq!(data, expected);
+}
+
+#[test]
 fn test_inner_access() {
     let path = PathBuf::from(TEST_IMAGE_DIR).join("tiled-rect-rgb-u8.tif");
     let img_file = File::open(path).expect("Cannot find test image!");
-    let mut decoder = Decoder::new(img_file).expect("Cannot create decoder");
+    let mut decoder = Decoder::open(img_file).expect("Cannot create decoder");
+    decoder.next_image().expect("Cannot read image IFD");
     assert_eq!(decoder.colortype().unwrap(), ColorType::RGB(8));
 
-    let c = decoder
+    let mut ifd = decoder.current_ifd();
+    let c = ifd
         .get_tag(tiff::tags::Tag::Compression)
         .unwrap()
         .into_u16()
@@ -248,13 +524,13 @@ fn test_inner_access() {
 
     // Because the image is uncompressed, reading the first tile directly with the inner reader
     // should yield the same result as reading it with the decoder's read_chunk method.
-    let first_offset = decoder
+    let first_offset = ifd
         .get_tag_u32_vec(tiff::tags::Tag::TileOffsets)
         .unwrap()
         .into_iter()
         .next()
         .unwrap();
-    let first_byte_count = decoder
+    let first_byte_count = ifd
         .get_tag_u32_vec(tiff::tags::Tag::TileByteCounts)
         .unwrap()
         .into_iter()
@@ -272,7 +548,7 @@ fn test_inner_access() {
     let raw_sum: u64 = buf.into_iter().map(<u64>::from).sum();
 
     match decoder.read_chunk(0).unwrap() {
-        DecodingResult::U8(chunk) => {
+        DecodingSampleBuffer::U8(chunk) => {
             let sum: u64 = chunk.into_iter().map(<u64>::from).sum();
             assert_eq!(sum, raw_sum);
         }
@@ -322,7 +598,8 @@ fn test_tiled_incremental() {
 
     let path = PathBuf::from(TEST_IMAGE_DIR).join(file);
     let img_file = File::open(path).expect("Cannot find test image!");
-    let mut decoder = Decoder::new(img_file).expect("Cannot create decoder");
+    let mut decoder = Decoder::open(img_file).expect("Cannot create decoder");
+    decoder.next_image().expect("Cannot read image IFD");
     assert_eq!(decoder.colortype().unwrap(), expected_type);
 
     let tiles = decoder.tile_count().unwrap();
@@ -330,7 +607,7 @@ fn test_tiled_incremental() {
 
     for tile in 0..tiles {
         match decoder.read_chunk(tile).unwrap() {
-            DecodingResult::U8(res) => {
+            DecodingSampleBuffer::U8(res) => {
                 let sum: u64 = res.into_iter().map(<u64>::from).sum();
                 assert_eq!(sum, sums[tile as usize]);
             }
@@ -352,7 +629,8 @@ fn test_read_planar_bands() {
 
     let path = PathBuf::from(TEST_IMAGE_DIR).join(file);
     let img_file = File::open(path).expect("Cannot find test image!");
-    let mut decoder = Decoder::new(img_file).expect("Cannot create decoder");
+    let mut decoder = Decoder::open(img_file).expect("Cannot create decoder");
+    decoder.next_image().expect("Cannot read image IFD");
     assert_eq!(decoder.colortype().unwrap(), expected_type);
 
     let chunks = decoder.strip_count().unwrap();
@@ -363,21 +641,21 @@ fn test_read_planar_bands() {
 
     // 1st band (red)
     match decoder.read_chunk(0).unwrap() {
-        DecodingResult::U8(chunk) => {
+        DecodingSampleBuffer::U8(chunk) => {
             assert_eq!(chunk[0], 73);
         }
         _ => panic!("Wrong bit depth"),
     }
     // 2nd band (green)
     match decoder.read_chunk(chunks / 3).unwrap() {
-        DecodingResult::U8(chunk) => {
+        DecodingSampleBuffer::U8(chunk) => {
             assert_eq!(chunk[0], 51);
         }
         _ => panic!("Wrong bit depth"),
     }
     // 3rd band (blue)
     match decoder.read_chunk(chunks / 3 * 2).unwrap() {
-        DecodingResult::U8(chunk) => {
+        DecodingSampleBuffer::U8(chunk) => {
             assert_eq!(chunk[0], 30);
         }
         _ => panic!("Wrong bit depth"),
@@ -396,7 +674,8 @@ fn test_div_zero() {
         178, 178, 178,
     ];
 
-    let err = tiff::decoder::Decoder::new(std::io::Cursor::new(&image)).unwrap_err();
+    let mut decoder = Decoder::open(std::io::Cursor::new(&image)).unwrap();
+    let err = decoder.next_image().unwrap_err();
 
     match err {
         TiffError::FormatError(TiffFormatError::StripTileTagConflict) => {}
@@ -414,7 +693,8 @@ fn test_too_many_value_bytes() {
         0, 89, 89, 89, 89, 89, 89, 89, 89, 96, 1, 20, 89, 89, 89, 89, 18,
     ];
 
-    let error = tiff::decoder::Decoder::new(std::io::Cursor::new(&image)).unwrap_err();
+    let mut decoder = Decoder::open(std::io::Cursor::new(&image)).unwrap();
+    let error = decoder.next_image().unwrap_err();
 
     match error {
         tiff::TiffError::LimitsExceeded => {}
@@ -432,7 +712,8 @@ fn fuzzer_testcase5() {
         178, 178, 178,
     ];
 
-    let _ = tiff::decoder::Decoder::new(std::io::Cursor::new(&image)).unwrap_err();
+    let mut decoder = Decoder::open(std::io::Cursor::new(&image)).unwrap();
+    let _ = decoder.next_image().unwrap_err();
 }
 
 #[test]
@@ -445,7 +726,8 @@ fn fuzzer_testcase1() {
         178,
     ];
 
-    let _ = tiff::decoder::Decoder::new(std::io::Cursor::new(&image)).unwrap_err();
+    let mut decoder = Decoder::open(std::io::Cursor::new(&image)).unwrap();
+    let _ = decoder.next_image().unwrap_err();
 }
 
 #[test]
@@ -458,7 +740,8 @@ fn fuzzer_testcase6() {
         178, 178,
     ];
 
-    let _ = tiff::decoder::Decoder::new(std::io::Cursor::new(&image)).unwrap_err();
+    let mut decoder = Decoder::open(std::io::Cursor::new(&image)).unwrap();
+    let _ = decoder.next_image().unwrap_err();
 }
 
 #[test]
@@ -470,7 +753,8 @@ fn oom() {
         0, 0, 0, 40, 0, 0, 0, 23, 1, 4, 0, 1, 0, 0, 0, 178, 48, 178, 178, 178, 178, 162, 178,
     ];
 
-    let _ = tiff::decoder::Decoder::new(std::io::Cursor::new(&image)).unwrap_err();
+    let mut decoder = Decoder::open(std::io::Cursor::new(&image)).unwrap();
+    let _ = decoder.next_image().unwrap_err();
 }
 
 #[test]
@@ -482,7 +766,8 @@ fn fuzzer_testcase4() {
         0, 0, 0, 40, 0, 0, 0, 23, 1, 4, 0, 1, 0, 0, 0, 48, 178, 178, 178, 0, 1, 0, 13, 13,
     ];
 
-    let _ = tiff::decoder::Decoder::new(std::io::Cursor::new(&image)).unwrap_err();
+    let mut decoder = Decoder::open(std::io::Cursor::new(&image)).unwrap();
+    let _ = decoder.next_image().unwrap_err();
 }
 
 #[test]
@@ -498,7 +783,8 @@ fn fuzzer_testcase2() {
         73,
     ];
 
-    let _ = tiff::decoder::Decoder::new(std::io::Cursor::new(&image)).unwrap_err();
+    let mut decoder = Decoder::open(std::io::Cursor::new(&image)).unwrap();
+    let _ = decoder.next_image().unwrap_err();
 }
 
 #[test]
@@ -514,7 +800,8 @@ fn invalid_jpeg_tag_2() {
         0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 36, 73, 73, 0, 42, 36, 36, 36, 36, 0, 0, 8, 0,
     ];
 
-    let _ = tiff::decoder::Decoder::new(std::io::Cursor::new(&image)).unwrap_err();
+    let mut decoder = Decoder::open(std::io::Cursor::new(&image)).unwrap();
+    let _ = decoder.next_image().unwrap_err();
 }
 
 #[test]
@@ -527,7 +814,8 @@ fn fuzzer_testcase3() {
         255, 255,
     ];
 
-    let _ = tiff::decoder::Decoder::new(std::io::Cursor::new(&image)).unwrap_err();
+    let mut decoder = Decoder::open(std::io::Cursor::new(&image)).unwrap();
+    let _ = decoder.next_image().unwrap_err();
 }
 
 #[test]
@@ -545,7 +833,8 @@ fn timeout() {
         0, 0, 73, 73, 42, 0, 8, 0, 0, 0, 0, 0, 32,
     ];
 
-    let error = tiff::decoder::Decoder::new(std::io::Cursor::new(&image)).unwrap_err();
+    let mut decoder = Decoder::open(std::io::Cursor::new(&image)).unwrap();
+    let error = decoder.next_image().unwrap_err();
 
     match error {
         TiffError::FormatError(TiffFormatError::CycleInOffsets) => {}
@@ -569,7 +858,7 @@ fn test_predictor_3_gray_f32() {
 }
 
 #[test]
-#[cfg(feature = "zstd")]
+#[cfg(any(feature = "zstd", feature = "zstd-safe-rust"))]
 fn test_zstd_compression() {
     // gdal_translate -co COMPRESS=ZSTD -co ZSTD_LEVEL=20 int16.tif int16_zstd.tif
     test_image_sum_i16("int16_zstd.tif", ColorType::Gray(16), 354396);
@@ -583,7 +872,8 @@ fn test_image_bytes(
 ) {
     let path = PathBuf::from(TEST_IMAGE_DIR).join(file);
     let img_file = File::open(path).expect("Cannot find test image!");
-    let mut decoder = Decoder::new(img_file).expect("Cannot create decoder");
+    let mut decoder = Decoder::open(img_file).expect("Cannot create decoder");
+    decoder.next_image().unwrap();
 
     let mut buffer = vec![0u8; 0];
     for (idx, &(expected_type, expected_crc)) in expected.iter().enumerate() {
@@ -670,5 +960,425 @@ fn bytes_gray_f32() {
         "gradient-1c-32b-float.tiff",
         &[(ColorType::Gray(32), 3232356730)],
         byte_order_u32,
+    );
+}
+
+#[test]
+#[cfg(feature = "fax")]
+fn test_fax4() {
+    test_image_sum_u8("fax4.tiff", ColorType::Gray(1), 7802706);
+}
+
+#[test]
+#[cfg(feature = "fax")]
+fn test_fax4_white_is_min() {
+    test_image_sum_u8("imagemagick_group4.tiff", ColorType::Gray(1), 3742820);
+}
+
+#[test]
+fn write_extra_bits_image() {
+    use tiff::{encoder, tags::ExtraSamples};
+
+    let path = PathBuf::from(TEST_IMAGE_DIR).join("extra_bits_rgb_8b.tiff");
+    let img_file = File::create(path).expect("Cannot find test image!");
+
+    let mut encoder = encoder::TiffEncoder::new(img_file).expect("Cannot create encoder");
+    let mut img = encoder.new_image::<encoder::colortype::RGB8>(8, 8).unwrap();
+
+    img.extra_samples(&[ExtraSamples::Unspecified]).unwrap();
+
+    // all pixels are supposed to be 0, the extra is 1
+    let data: [u8; 256] = core::array::from_fn(|i| (i as u8 % 4).saturating_sub(2));
+
+    img.write_data(&data)
+        .expect("correct amount of data to write");
+}
+
+#[test]
+fn extra_bits_gray() {
+    test_image_sum_u8(
+        "extra_bits_gray_8b.tiff",
+        ColorType::Multiband {
+            bit_depth: 8,
+            num_samples: 2,
+        },
+        64,
+    );
+}
+
+#[test]
+fn extra_bits_rgb() {
+    test_image_sum_u8("extra_bits_rgb_8b.tiff", ColorType::RGBA(8), 64);
+}
+
+#[test]
+#[cfg(feature = "fax")]
+fn test_decode_huge_g4() {
+    let path = PathBuf::from(TEST_IMAGE_DIR).join("big_g4.tif");
+    let img_file = File::open(path).expect("failed to open large G4 test image");
+    let mut decoder = Decoder::open(img_file).expect("failed to create decoder");
+
+    decoder.next_image().expect("failed to read image IFD");
+    let (width, height) = decoder.dimensions().expect("failed to get dimensions");
+
+    assert!(
+        height > u16::MAX as u32,
+        "Test image height {} is not large enough to test u16 overflow",
+        height
+    );
+
+    let result = decoder
+        .read_image()
+        .expect("failed to decode huge G4 image");
+
+    if let tiff::decoder::DecodingSampleBuffer::U8(data) = result {
+        assert_eq!(data.len(), (width as usize * height as usize));
+    } else {
+        panic!("Unexpected decoding result type");
+    }
+}
+
+// ---- WhiteIsZero tests across bit depths ----
+
+// WhiteIsZero + extended bit depth (12-bit gray, synthetic 4x2 image)
+#[test]
+fn test_gray_u12_white_is_zero() {
+    // Values: [0, 1000, 2000, 4095, 100, 500, 3000, 3500]
+    // After WhiteIsZero inversion: [4095, 3095, 2095, 0, 3995, 3595, 1095, 595]
+    test_image_sum_u16("miniswhite-1c-12b.tiff", ColorType::Gray(12), 18565);
+}
+
+// WhiteIsZero + non-standard sub-byte depths (3-bit and 6-bit, synthetic 8x2 images)
+// These verify per-sample inversion for packed depths where samples cross byte boundaries.
+#[test]
+fn test_gray_u3_white_is_zero() {
+    test_image_sum_u8("miniswhite-1c-3b.tiff", ColorType::Gray(3), 765);
+}
+
+#[test]
+fn test_gray_u6_white_is_zero() {
+    // Values: [0, 10, 20, 30, 40, 50, 60, 63] × 2 rows
+    // After inversion: [63, 53, 43, 33, 23, 13, 3, 0] × 2 rows
+    test_image_sum_u8("miniswhite-1c-6b.tiff", ColorType::Gray(6), 2124);
+}
+
+// ---- Non-standard sub-byte depths (BlackIsZero) ----
+// Verify that odd bit depths (3, 5, 7) decode without error.
+
+#[test]
+fn test_gray_u3() {
+    // 8x2 image, values [0..7, 7..0], packed to 6 bytes
+    test_image_sum_u8("minisblack-1c-3b.tiff", ColorType::Gray(3), 765);
+}
+
+#[test]
+fn test_gray_u5() {
+    // 8x2 image, packed to 10 bytes
+    test_image_sum_u8("minisblack-1c-5b.tiff", ColorType::Gray(5), 1275);
+}
+
+#[test]
+fn test_gray_u7() {
+    // 8x2 image, packed to 14 bytes
+    test_image_sum_u8("minisblack-1c-7b.tiff", ColorType::Gray(7), 1711);
+}
+
+// ---- Horizontal predictor + extended bit depth ----
+
+#[test]
+fn test_gray_u12_hpredict() {
+    // Delta-encoded 12-bit values: [100, 200, 300, 400, 1000, 2000, 3000, 4000]
+    test_image_sum_u16("hpredict-1c-12b.tiff", ColorType::Gray(12), 11000);
+}
+
+// ---- Old-style LZW ----
+
+#[test]
+fn test_old_style_lzw() {
+    // Pre-TIFF-6.0 "old-style" LZW: LSB-first bit order with no early-change size
+    // switch. Auto-detected from the stream (first byte 0x00, second byte odd).
+    // Same image as libtiffpic's quad-lzw.tif; the decoded pixels must match.
+    test_image_sum_u8("quad-lzw-compat.tiff", ColorType::RGB(8), 21048924);
+}
+
+// ---- TransparencyMask ----
+
+/// Build a minimal uncompressed 2x2 TIFF in memory, in the requested byte order,
+/// with the given photometric interpretation and the pixel data as a single strip.
+/// `sample_format` is emitted as a SampleFormat tag when `Some`; when `None` the
+/// tag is omitted (the decoder then defaults to unsigned). Pixel bytes must already
+/// be in `byte_order`.
+fn build_raw_tiff(
+    byte_order: ByteOrder,
+    photometric: PhotometricInterpretation,
+    bits_per_sample: u16,
+    samples_per_pixel: u16,
+    sample_format: Option<SampleFormat>,
+    pixel_data: &[u8],
+) -> Vec<u8> {
+    let le = matches!(byte_order, ByteOrder::LittleEndian);
+    let put16 = |buf: &mut Vec<u8>, v: u16| {
+        if le {
+            buf.extend_from_slice(&v.to_le_bytes());
+        } else {
+            buf.extend_from_slice(&v.to_be_bytes());
+        }
+    };
+    let put32 = |buf: &mut Vec<u8>, v: u32| {
+        if le {
+            buf.extend_from_slice(&v.to_le_bytes());
+        } else {
+            buf.extend_from_slice(&v.to_be_bytes());
+        }
+    };
+
+    let width: u16 = 2;
+    let height: u16 = 2;
+    let num_tags: u16 = if sample_format.is_some() { 9 } else { 8 };
+    let ifd_offset: u32 = 8;
+    let ifd_size = 2 + (num_tags as u32) * 12 + 4;
+    let strip_offset = 8 + ifd_size;
+
+    // IFD entries (must be ascending tag order). Tag IDs stay raw for the
+    // ascending-order property; the field type uses the `Type` enum.
+    let mut tags: Vec<(u16, Type, u32)> = vec![
+        (256, Type::SHORT, width as u32),                // ImageWidth
+        (257, Type::SHORT, height as u32),               // ImageLength
+        (258, Type::SHORT, bits_per_sample as u32),      // BitsPerSample
+        (259, Type::SHORT, 1),                           // Compression = None
+        (262, Type::SHORT, photometric.to_u16() as u32), // PhotometricInterpretation
+        (273, Type::LONG, strip_offset),                 // StripOffsets
+        (277, Type::SHORT, samples_per_pixel as u32),    // SamplesPerPixel
+        (279, Type::LONG, pixel_data.len() as u32),      // StripByteCounts
+    ];
+    if let Some(sf) = sample_format {
+        tags.push((339, Type::SHORT, sf.to_u16() as u32)); // SampleFormat (tag 339 > 279)
+    }
+
+    let mut buf = Vec::new();
+    buf.extend_from_slice(if le { b"II" } else { b"MM" });
+    put16(&mut buf, 42);
+    put32(&mut buf, ifd_offset);
+    put16(&mut buf, num_tags);
+
+    for (tag, typ, value) in tags {
+        put16(&mut buf, tag);
+        put16(&mut buf, typ.to_u16());
+        put32(&mut buf, 1); // count
+                            // A SHORT value is left-justified in the 4-byte value field (value in the
+                            // first two bytes, then padding); a LONG fills all four.
+        match typ {
+            Type::SHORT => {
+                put16(&mut buf, value as u16);
+                put16(&mut buf, 0);
+            }
+            _ => put32(&mut buf, value),
+        }
+    }
+
+    put32(&mut buf, 0); // next IFD = 0
+    buf.extend_from_slice(pixel_data);
+    buf
+}
+
+#[test]
+fn test_transparency_mask() {
+    // 2x2 mask: values 0, 255, 128, 64
+    let data = build_raw_tiff(
+        ByteOrder::LittleEndian,
+        PhotometricInterpretation::TransparencyMask,
+        8,
+        1,
+        None,
+        &[0, 255, 128, 64],
+    );
+    let mut decoder = Decoder::open(Cursor::new(&data)).unwrap();
+    decoder.next_image().unwrap();
+
+    assert_eq!(decoder.colortype().unwrap(), ColorType::Gray(8));
+
+    let result = decoder.read_image().unwrap();
+    match result {
+        DecodingSampleBuffer::U8(pixels) => {
+            // TransparencyMask is decoded as grayscale
+            assert_eq!(pixels.len(), 4);
+            assert_eq!(pixels[0], 0);
+            assert_eq!(pixels[1], 255);
+            assert_eq!(pixels[2], 128);
+            assert_eq!(pixels[3], 64);
+        }
+        _ => panic!("Expected U8 buffer"),
+    }
+}
+
+// ---- CIE L*a*b* ----
+
+#[test]
+fn test_cielab_decode() {
+    // 2x2 CIELab image: 3 bytes per pixel (L, a, b)
+    // L=128, a=0 (signed neutral), b=0 (signed neutral)
+    // After re-biasing: a=128 (unsigned neutral), b=128 (unsigned neutral)
+    let pixels: Vec<u8> = vec![
+        128, 0, 0, // pixel 0: L=128, a=0, b=0 (neutral gray)
+        255, 50, 50, // pixel 1: L=255, a=+50, b=+50
+        100, 206, 206, // pixel 2: L=100, a=-50 (as i8), b=-50 (as i8)
+        0, 128, 128, // pixel 3: L=0, a=-128 (as i8), b=-128 (as i8)
+    ];
+
+    let data = build_raw_tiff(
+        ByteOrder::LittleEndian,
+        PhotometricInterpretation::CIELab,
+        8,
+        3,
+        None,
+        &pixels,
+    );
+    let mut decoder = Decoder::open(Cursor::new(&data)).unwrap();
+    decoder.next_image().unwrap();
+
+    assert_eq!(decoder.colortype().unwrap(), ColorType::Lab(8));
+
+    let result = decoder.read_image().unwrap();
+    match result {
+        DecodingSampleBuffer::U8(decoded) => {
+            assert_eq!(decoded.len(), 12); // 4 pixels * 3 channels
+
+            // Pixel 0: L=128, a=0+128=128, b=0+128=128
+            assert_eq!(decoded[0], 128);
+            assert_eq!(decoded[1], 128);
+            assert_eq!(decoded[2], 128);
+
+            // Pixel 1: L=255, a=50+128=178, b=50+128=178
+            assert_eq!(decoded[3], 255);
+            assert_eq!(decoded[4], 178);
+            assert_eq!(decoded[5], 178);
+
+            // Pixel 2: L=100, a=206+128=78 (wrapping), b=206+128=78
+            assert_eq!(decoded[6], 100);
+            assert_eq!(decoded[7], 78);
+            assert_eq!(decoded[8], 78);
+
+            // Pixel 3: L=0, a=128+128=0 (wrapping), b=128+128=0
+            assert_eq!(decoded[9], 0);
+            assert_eq!(decoded[10], 0);
+            assert_eq!(decoded[11], 0);
+        }
+        _ => panic!("Expected U8 buffer"),
+    }
+}
+
+#[test]
+fn test_cielab_decode_16() {
+    // 2x2 16-bit CIELab image: 3 u16 samples per pixel (L, a, b), a/b signed.
+    // Re-biasing maps signed a/b to unsigned by adding 0x8000 (wrapping):
+    //   0 -> 32768, +1000 -> 33768, -1000 -> 31768, -32768 -> 0, +32767 -> 65535.
+    let samples: [u16; 12] = [
+        32768, 0, 0, // pixel 0: L, a=0, b=0 (neutral)
+        65535, 1000, 1000, // pixel 1: a=+1000, b=+1000
+        10000, 64536, 64536, // pixel 2: a=-1000, b=-1000 (as u16)
+        0, 32768, 32767, // pixel 3: a=-32768, b=+32767 (as u16)
+    ];
+    let mut pixels = Vec::new();
+    for s in samples {
+        pixels.extend_from_slice(&s.to_le_bytes());
+    }
+
+    let data = build_raw_tiff(
+        ByteOrder::LittleEndian,
+        PhotometricInterpretation::CIELab,
+        16,
+        3,
+        None,
+        &pixels,
+    );
+    let mut decoder = Decoder::open(Cursor::new(&data)).unwrap();
+    decoder.next_image().unwrap();
+
+    assert_eq!(decoder.colortype().unwrap(), ColorType::Lab(16));
+
+    let result = decoder.read_image().unwrap();
+    match result {
+        DecodingSampleBuffer::U16(decoded) => {
+            assert_eq!(decoded.len(), 12); // 4 pixels * 3 channels
+
+            // L unchanged; a/b re-biased by +0x8000 (wrapping).
+            let expected: [u16; 12] = [
+                32768, 32768, 32768, // pixel 0
+                65535, 33768, 33768, // pixel 1
+                10000, 31768, 31768, // pixel 2
+                0, 0, 65535, // pixel 3
+            ];
+            assert_eq!(decoded, expected);
+        }
+        _ => panic!("Expected U16 buffer"),
+    }
+}
+
+#[test]
+fn test_cielab_decode_16_big_endian() {
+    // Same image and expected output as `test_cielab_decode_16`, but stored as a
+    // big-endian ("MM") TIFF. 16-bit is the case where byte order matters: the
+    // decoder must swap to native before the a/b re-bias, so the result is
+    // identical to the little-endian case.
+    let samples: [u16; 12] = [
+        32768, 0, 0, // pixel 0
+        65535, 1000, 1000, // pixel 1
+        10000, 64536, 64536, // pixel 2
+        0, 32768, 32767, // pixel 3
+    ];
+    let mut pixels = Vec::new();
+    for s in samples {
+        pixels.extend_from_slice(&s.to_be_bytes());
+    }
+
+    let data = build_raw_tiff(
+        ByteOrder::BigEndian,
+        PhotometricInterpretation::CIELab,
+        16,
+        3,
+        None,
+        &pixels,
+    );
+    let mut decoder = Decoder::open(Cursor::new(&data)).unwrap();
+    decoder.next_image().unwrap();
+
+    assert_eq!(decoder.colortype().unwrap(), ColorType::Lab(16));
+
+    let result = decoder.read_image().unwrap();
+    match result {
+        DecodingSampleBuffer::U16(decoded) => {
+            let expected: [u16; 12] = [
+                32768, 32768, 32768, // pixel 0
+                65535, 33768, 33768, // pixel 1
+                10000, 31768, 31768, // pixel 2
+                0, 0, 65535, // pixel 3
+            ];
+            assert_eq!(decoded, expected);
+        }
+        _ => panic!("Expected U16 buffer"),
+    }
+}
+
+#[test]
+fn test_cielab_rejects_non_uint_sample_format() {
+    // CIELab treats a/b as signed via the photometric interpretation and requires
+    // SampleFormat::Uint (matching the ICCLab arm). A file declaring Int must be
+    // rejected rather than silently producing a signed output buffer.
+    let pixels = vec![0u8; 12]; // 2x2, 3 samples, 8-bit
+    let data = build_raw_tiff(
+        ByteOrder::LittleEndian,
+        PhotometricInterpretation::CIELab,
+        8,
+        3,
+        Some(SampleFormat::Int),
+        &pixels,
+    );
+
+    let mut decoder = Decoder::open(Cursor::new(&data)).unwrap();
+    // Rejection may surface at either next_image() or colortype().
+    let rejected = decoder.next_image().is_err() || decoder.colortype().is_err();
+    assert!(
+        rejected,
+        "CIELab with SampleFormat=Int must be rejected, not decoded"
     );
 }

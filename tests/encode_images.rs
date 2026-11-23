@@ -1,7 +1,7 @@
 extern crate tiff;
 
-use tiff::decoder::{ifd, Decoder, DecodingResult};
-use tiff::encoder::{colortype, Ifd, Ifd8, SRational, TiffEncoder};
+use tiff::decoder::{ifd, Decoder, DecodingSampleBuffer};
+use tiff::encoder::{colortype, Ifd, Ifd8, Predictor, SRational, TiffEncoder};
 use tiff::tags::Tag;
 use tiff::ColorType;
 
@@ -33,11 +33,14 @@ fn encode_decode() {
     }
     {
         file.seek(SeekFrom::Start(0)).unwrap();
-        let mut decoder = Decoder::new(&mut file).unwrap();
+        let mut decoder = Decoder::open(&mut file).unwrap();
+        decoder.next_image().unwrap();
+
         assert_eq!(decoder.colortype().unwrap(), ColorType::RGB(8));
         assert_eq!(decoder.dimensions().unwrap(), (100, 100));
 
         let mut all_tags = decoder
+            .current_ifd()
             .tag_iter()
             .filter_map(Result::ok)
             .collect::<Vec<_>>();
@@ -57,7 +60,7 @@ fn encode_decode() {
                 ),
                 (Tag::Compression, ifd::Value::Short(1)),
                 (Tag::PhotometricInterpretation, ifd::Value::Short(2)),
-                (Tag::StripOffsets, ifd::Value::Unsigned(47)),
+                (Tag::StripOffsets, ifd::Value::Unsigned(35)),
                 (Tag::SamplesPerPixel, ifd::Value::Short(3)),
                 (Tag::RowsPerStrip, ifd::Value::Unsigned(3334)),
                 (Tag::StripByteCounts, ifd::Value::Unsigned(30000)),
@@ -78,10 +81,13 @@ fn encode_decode() {
         );
 
         assert_eq!(
-            decoder.get_tag(Tag::Artist).unwrap(),
+            decoder.current_ifd().get_tag(Tag::Artist).unwrap(),
             ifd::Value::Ascii("Image-tiff".into())
         );
-        if let DecodingResult::U8(img_res) = decoder.read_image().unwrap() {
+
+        let mut buffer = tiff::decoder::DecodingSampleBuffer::U8(vec![]);
+        let _layout = decoder.read_image_to_buffer(&mut buffer).unwrap();
+        if let tiff::decoder::DecodingSampleBuffer::U8(img_res) = buffer {
             assert_eq!(image_data, img_res);
         } else {
             panic!("Wrong data type");
@@ -113,11 +119,14 @@ fn encode_decode_big() {
     }
     {
         file.seek(SeekFrom::Start(0)).unwrap();
-        let mut decoder = Decoder::new(&mut file).unwrap();
+        let mut decoder = Decoder::open(&mut file).unwrap();
+        decoder.next_image().unwrap();
+
         assert_eq!(decoder.colortype().unwrap(), ColorType::RGB(8));
         assert_eq!(decoder.dimensions().unwrap(), (100, 100));
 
         let mut all_tags = decoder
+            .current_ifd()
             .tag_iter()
             .filter_map(Result::ok)
             .collect::<Vec<_>>();
@@ -158,10 +167,12 @@ fn encode_decode_big() {
         );
 
         assert_eq!(
-            decoder.get_tag(Tag::Artist).unwrap(),
+            decoder.current_ifd().get_tag(Tag::Artist).unwrap(),
             ifd::Value::Ascii("Image-tiff".into())
         );
-        if let DecodingResult::U8(img_res) = decoder.read_image().unwrap() {
+        let mut buffer = tiff::decoder::DecodingSampleBuffer::U8(vec![]);
+        let _layout = decoder.read_image_to_buffer(&mut buffer).unwrap();
+        if let DecodingSampleBuffer::U8(img_res) = buffer {
             assert_eq!(image_data, img_res);
         } else {
             panic!("Wrong data type");
@@ -202,8 +213,10 @@ fn test_encode_ifd() {
 
     // Rewind the cursor for reading
     data.set_position(0);
+
     {
-        let mut decoder = Decoder::new(&mut data).unwrap();
+        let mut decoder = Decoder::open(&mut data).unwrap();
+        decoder.next_image().unwrap();
 
         assert_eq!(decoder.assert_tag_u32(65000), 42);
         assert_eq!(decoder.assert_tag_u32_vec(65000), [42]);
@@ -235,17 +248,23 @@ const TEST_IMAGE_DIR: &str = "./tests/images/";
 
 macro_rules! test_roundtrip {
     ($name:ident, $buffer:ident, $buffer_ty:ty) => {
+        #[track_caller]
         fn $name<C: colortype::ColorType<Inner = $buffer_ty>>(
             file: &str,
             expected_type: ColorType,
         ) {
             let path = PathBuf::from(TEST_IMAGE_DIR).join(file);
             let img_file = File::open(path).expect("Cannot find test image!");
-            let mut decoder = Decoder::new(img_file).expect("Cannot create decoder");
+            let mut decoder = Decoder::open(img_file).expect("Cannot create decoder");
+            decoder.next_image().unwrap();
+
             assert_eq!(decoder.colortype().unwrap(), expected_type);
 
-            let image_data = match decoder.read_image().unwrap() {
-                DecodingResult::$buffer(res) => res,
+            let mut buffer = tiff::decoder::DecodingSampleBuffer::U8(vec![]);
+            decoder.read_image_to_buffer(&mut buffer).unwrap();
+
+            let image_data = match buffer {
+                DecodingSampleBuffer::$buffer(res) => res,
                 _ => panic!("Wrong data type"),
             };
 
@@ -258,9 +277,12 @@ macro_rules! test_roundtrip {
             }
             file.seek(SeekFrom::Start(0)).unwrap();
             {
-                let mut decoder = Decoder::new(&mut file).unwrap();
-                if let DecodingResult::$buffer(img_res) = decoder.read_image().unwrap() {
-                    assert_eq!(image_data, img_res);
+                let mut buffer = tiff::decoder::DecodingSampleBuffer::U8(vec![]);
+                let mut decoder = Decoder::open(&mut file).unwrap();
+                decoder.next_image().unwrap();
+                decoder.read_image_to_buffer(&mut buffer).unwrap();
+                if let DecodingSampleBuffer::$buffer(img_res) = buffer {
+                    assert_eq!(*image_data, img_res);
                 } else {
                     panic!("Wrong data type");
                 }
@@ -368,6 +390,144 @@ fn test_ycbcr_u8_roundtrip() {
     test_u8_roundtrip::<colortype::YCbCr8>("tiled-jpeg-ycbcr.tif", ColorType::YCbCr(8));
 }
 
+/// Test that encoding with the floating-point predictor works correctly
+/// and can be decoded back to the original data.
+#[test]
+fn test_gray_f32_floating_point_predictor() {
+    // Generate test data: a gradient of f32 values
+    let width = 32u32;
+    let height = 32u32;
+    let mut image_data: Vec<f32> = Vec::with_capacity((width * height) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            // Create a gradient pattern
+            image_data.push((x as f32 + y as f32 * 0.1) / 100.0);
+        }
+    }
+
+    let mut file = Cursor::new(Vec::new());
+    {
+        let mut tiff = TiffEncoder::new(&mut file)
+            .unwrap()
+            .with_predictor(Predictor::FloatingPoint);
+        tiff.write_image::<colortype::Gray32Float>(width, height, &image_data)
+            .unwrap();
+    }
+
+    file.seek(SeekFrom::Start(0)).unwrap();
+    {
+        let mut decoder = Decoder::open(&mut file).unwrap();
+        decoder.next_image().unwrap();
+        assert_eq!(decoder.colortype().unwrap(), ColorType::Gray(32));
+
+        let mut buffer = DecodingSampleBuffer::F32(vec![]);
+        decoder.read_image_to_buffer(&mut buffer).unwrap();
+        if let DecodingSampleBuffer::F32(img_res) = buffer {
+            assert_eq!(image_data.len(), img_res.len());
+            for (orig, decoded) in image_data.iter().zip(img_res.iter()) {
+                assert_eq!(
+                    *orig, *decoded,
+                    "Mismatch at value: orig={}, decoded={}",
+                    orig, decoded
+                );
+            }
+        } else {
+            panic!("Wrong data type");
+        }
+    }
+}
+
+/// Test floating-point predictor with RGB f32 data
+#[test]
+fn test_rgb_f32_floating_point_predictor() {
+    let width = 16u32;
+    let height = 16u32;
+    let mut image_data: Vec<f32> = Vec::with_capacity((width * height * 3) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            // RGB pattern
+            image_data.push(x as f32 / width as f32); // R
+            image_data.push(y as f32 / height as f32); // G
+            image_data.push((x + y) as f32 / (width + height) as f32); // B
+        }
+    }
+
+    let mut file = Cursor::new(Vec::new());
+    {
+        let mut tiff = TiffEncoder::new(&mut file)
+            .unwrap()
+            .with_predictor(Predictor::FloatingPoint);
+        tiff.write_image::<colortype::RGB32Float>(width, height, &image_data)
+            .unwrap();
+    }
+
+    file.seek(SeekFrom::Start(0)).unwrap();
+    {
+        let mut decoder = Decoder::open(&mut file).unwrap();
+        decoder.next_image().unwrap();
+        assert_eq!(decoder.colortype().unwrap(), ColorType::RGB(32));
+
+        let mut buffer = DecodingSampleBuffer::F32(vec![]);
+        decoder.read_image_to_buffer(&mut buffer).unwrap();
+        if let DecodingSampleBuffer::F32(img_res) = buffer {
+            assert_eq!(image_data.len(), img_res.len());
+            for (i, (orig, decoded)) in image_data.iter().zip(img_res.iter()).enumerate() {
+                assert_eq!(
+                    *orig, *decoded,
+                    "Mismatch at index {}: orig={}, decoded={}",
+                    i, orig, decoded
+                );
+            }
+        } else {
+            panic!("Wrong data type");
+        }
+    }
+}
+
+/// Test floating-point predictor with f64 data
+#[test]
+fn test_gray_f64_floating_point_predictor() {
+    let width = 16u32;
+    let height = 16u32;
+    let mut image_data: Vec<f64> = Vec::with_capacity((width * height) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            image_data.push((x as f64 + y as f64 * 0.1) / 100.0);
+        }
+    }
+
+    let mut file = Cursor::new(Vec::new());
+    {
+        let mut tiff = TiffEncoder::new(&mut file)
+            .unwrap()
+            .with_predictor(Predictor::FloatingPoint);
+        tiff.write_image::<colortype::Gray64Float>(width, height, &image_data)
+            .unwrap();
+    }
+
+    file.seek(SeekFrom::Start(0)).unwrap();
+    {
+        let mut decoder = Decoder::open(&mut file).unwrap();
+        decoder.next_image().unwrap();
+        assert_eq!(decoder.colortype().unwrap(), ColorType::Gray(64));
+
+        let mut buffer = DecodingSampleBuffer::F64(vec![]);
+        decoder.read_image_to_buffer(&mut buffer).unwrap();
+        if let DecodingSampleBuffer::F64(img_res) = buffer {
+            assert_eq!(image_data.len(), img_res.len());
+            for (orig, decoded) in image_data.iter().zip(img_res.iter()) {
+                assert_eq!(
+                    *orig, *decoded,
+                    "Mismatch: orig={}, decoded={}",
+                    orig, decoded
+                );
+            }
+        } else {
+            panic!("Wrong data type");
+        }
+    }
+}
+
 trait AssertDecode {
     fn assert_tag_u32(&mut self, tag: u16) -> u32;
     fn assert_tag_u32_vec(&mut self, tag: u16) -> Vec<u32>;
@@ -381,37 +541,57 @@ trait AssertDecode {
 
 impl<R: std::io::Read + std::io::Seek> AssertDecode for Decoder<R> {
     fn assert_tag_u32(&mut self, tag: u16) -> u32 {
-        self.get_tag(Tag::Unknown(tag)).unwrap().into_u32().unwrap()
+        self.current_ifd()
+            .get_tag(Tag::Unknown(tag))
+            .unwrap()
+            .into_u32()
+            .unwrap()
     }
     fn assert_tag_u32_vec(&mut self, tag: u16) -> Vec<u32> {
-        self.get_tag(Tag::Unknown(tag))
+        self.current_ifd()
+            .get_tag(Tag::Unknown(tag))
             .unwrap()
             .into_u32_vec()
             .unwrap()
     }
     fn assert_tag_i32(&mut self, tag: u16) -> i32 {
-        self.get_tag(Tag::Unknown(tag)).unwrap().into_i32().unwrap()
+        self.current_ifd()
+            .get_tag(Tag::Unknown(tag))
+            .unwrap()
+            .into_i32()
+            .unwrap()
     }
     fn assert_tag_i32_vec(&mut self, tag: u16) -> Vec<i32> {
-        self.get_tag(Tag::Unknown(tag))
+        self.current_ifd()
+            .get_tag(Tag::Unknown(tag))
             .unwrap()
             .into_i32_vec()
             .unwrap()
     }
     fn assert_tag_u64(&mut self, tag: u16) -> u64 {
-        self.get_tag(Tag::Unknown(tag)).unwrap().into_u64().unwrap()
+        self.current_ifd()
+            .get_tag(Tag::Unknown(tag))
+            .unwrap()
+            .into_u64()
+            .unwrap()
     }
     fn assert_tag_u64_vec(&mut self, tag: u16) -> Vec<u64> {
-        self.get_tag(Tag::Unknown(tag))
+        self.current_ifd()
+            .get_tag(Tag::Unknown(tag))
             .unwrap()
             .into_u64_vec()
             .unwrap()
     }
     fn assert_tag_i64(&mut self, tag: u16) -> i64 {
-        self.get_tag(Tag::Unknown(tag)).unwrap().into_i64().unwrap()
+        self.current_ifd()
+            .get_tag(Tag::Unknown(tag))
+            .unwrap()
+            .into_i64()
+            .unwrap()
     }
     fn assert_tag_i64_vec(&mut self, tag: u16) -> Vec<i64> {
-        self.get_tag(Tag::Unknown(tag))
+        self.current_ifd()
+            .get_tag(Tag::Unknown(tag))
             .unwrap()
             .into_i64_vec()
             .unwrap()
@@ -445,7 +625,8 @@ fn test_multiple_byte() {
 
     data.set_position(0);
     {
-        let mut decoder = Decoder::new(&mut data).unwrap();
+        let mut decoder = Decoder::open(&mut data).unwrap();
+        decoder.next_image().unwrap();
 
         assert_eq!(decoder.assert_tag_u32_vec(65000), [1]);
         assert_eq!(decoder.assert_tag_u32_vec(65001), [1, 2]);
@@ -526,7 +707,8 @@ fn test_signed() {
     //Rewind the cursor for reading
     data.set_position(0);
     {
-        let mut decoder = Decoder::new(&mut data).unwrap();
+        let mut decoder = Decoder::open(&mut data).unwrap();
+        decoder.next_image().unwrap();
 
         assert_eq!(decoder.assert_tag_i32(65000), -1);
         assert_eq!(decoder.assert_tag_i32_vec(65001), [-1]);
@@ -578,13 +760,14 @@ fn test_multipage_image() {
     img_file.seek(SeekFrom::Start(0)).unwrap();
 
     {
-        let mut img_decoder = Decoder::new(&mut img_file).unwrap();
+        let mut decoder = Decoder::open(&mut img_file).unwrap();
+        decoder.next_image().unwrap();
 
         // check the dimensions of the image in the first page
-        assert_eq!(img_decoder.dimensions().unwrap(), (2, 2));
-        img_decoder.next_image().unwrap();
+        assert_eq!(decoder.dimensions().unwrap(), (2, 2));
+        decoder.next_image().unwrap();
         // check the dimensions of the image in the second page
-        assert_eq!(img_decoder.dimensions().unwrap(), (3, 3));
+        assert_eq!(decoder.dimensions().unwrap(), (3, 3));
     }
 }
 
@@ -613,14 +796,21 @@ fn test_rows_per_strip() {
 
     file.seek(SeekFrom::Start(0)).unwrap();
     {
-        let mut decoder = Decoder::new(&mut file).unwrap();
-        assert_eq!(decoder.get_tag_u64(Tag::RowsPerStrip).unwrap(), 2);
+        let mut decoder = Decoder::open(&mut file).unwrap();
+        decoder.next_image().unwrap();
+        assert_eq!(
+            decoder
+                .current_ifd()
+                .get_tag_u64(Tag::RowsPerStrip)
+                .unwrap(),
+            2
+        );
         assert_eq!(decoder.strip_count().unwrap(), 50);
 
         for i in 0..50 {
             let img2 = [i; 2 * 100];
             match decoder.read_chunk(i as u32).unwrap() {
-                DecodingResult::U8(data) => assert_eq!(&img2[..], &data[..]),
+                DecodingSampleBuffer::U8(data) => assert_eq!(&img2[..], &data[..]),
                 other => panic!("Incorrect strip type {other:?}"),
             }
         }
@@ -653,9 +843,10 @@ fn test_auxiliary_directory() {
     }
 
     data.set_position(0);
-    let mut decoder = Decoder::new(&mut data).unwrap();
+    let mut decoder = Decoder::open(&mut data).unwrap();
 
     {
+        decoder.next_image().unwrap();
         assert_eq!(decoder.dimensions().unwrap(), (1, 1));
         let _ = decoder.read_image().unwrap();
     }
@@ -666,6 +857,7 @@ fn test_auxiliary_directory() {
         let _ = decoder.read_image().unwrap();
 
         let exif_location = decoder
+            .current_ifd()
             .get_tag(Tag::ExifDirectory)
             .expect("second directory missing Exif")
             .into_ifd_pointer()
